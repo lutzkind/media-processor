@@ -74,15 +74,7 @@ async def upload_file(
 
 # ── thumbnail ────────────────────────────────────────────────────────────────
 
-@app.get("/thumb/{public_id:path}.jpg")
-async def get_thumbnail(
-    public_id: str,
-    w: int = Query(1280),
-    h: int = Query(720),
-    c: str = Query("fill"),    # crop mode: fill | crop | scale
-    g: str = Query("center"),  # gravity:  north | south | center | northeast | northwest
-    t: float = Query(0.0),     # seek offset in seconds
-):
+async def _thumbnail_response(public_id: str, w: int, h: int, c: str, g: str, t: float):
     """Extract a JPEG thumbnail from a video or image file."""
     file_path = _find_file(public_id)
     if not file_path:
@@ -111,6 +103,30 @@ async def get_thumbnail(
             raise HTTPException(500, f"Thumbnail error: {stderr.decode()[-600:]}")
 
     return FileResponse(thumb_path, media_type="image/jpeg")
+
+
+@app.get("/thumb/{public_id:path}.jpg")
+async def get_thumbnail(
+    public_id: str,
+    w: int = Query(1280),
+    h: int = Query(720),
+    c: str = Query("fill"),    # crop mode: fill | crop | scale
+    g: str = Query("center"),  # gravity:  north | south | center | northeast | northwest
+    t: float = Query(0.0),     # seek offset in seconds
+):
+    return await _thumbnail_response(public_id, w, h, c, g, t)
+
+
+@app.get("/thumbx/{w}x{h}/{c}/{g}/{t}/{public_id:path}.jpg")
+async def get_thumbnail_path(
+    public_id: str,
+    w: int,
+    h: int,
+    c: str,
+    g: str,
+    t: float,
+):
+    return await _thumbnail_response(public_id, w, h, c, g, t)
 
 
 # ── composite ────────────────────────────────────────────────────────────────
