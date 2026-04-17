@@ -119,10 +119,10 @@ class CompositeRequest(BaseModel):
     base_id: str                  # public_id of the screenshot / base video
     overlay_name: str = "faceintro"  # named asset for circular face overlay
     splice_name: str = "video"       # named asset concatenated after the intro
-    overlay_w: int = 220
-    overlay_h: int = 220
-    overlay_x: int = 48           # px offset from SE edge
-    overlay_y: int = 48
+    overlay_w: int = 206
+    overlay_h: int = 206
+    overlay_x: int = 62           # px offset from SE edge
+    overlay_y: int = 36
     output_w: int = 1280
     output_h: int = 720
 
@@ -179,14 +179,11 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
     cmd1.extend([
         "-i", str(base_path),
         "-i", str(overlay_path),
-        "-f", "lavfi",
-        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-filter_complex", filter_p1,
         "-map", "[out]",
-        "-map", "2:a",
+        "-map", "1:a?",
     ])
-    # Stop when the composed video stream ends. This keeps synthetic audio
-    # from making ffmpeg run forever for silent base videos.
+    # Stop when the composed video stream ends.
     cmd1.append("-shortest")
     cmd1.extend([
         "-c:v", "libx264", "-preset", "fast", "-crf", "22",
