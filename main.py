@@ -1,13 +1,14 @@
 import asyncio
 import mimetypes
 import os
+import secrets
 import uuid
 from pathlib import Path
 from typing import Optional
 
 import aiofiles
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Media Processor API")
@@ -251,165 +252,457 @@ async def health():
     return {"status": "ok"}
 
 
+# ── session store (in-memory, single-node) ───────────────────────────────────
+# Maps session token → True. Cleared on restart; fine for a single-user tool.
+_sessions: set[str] = set()
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", API_KEY or "changeme")
+
+
+def _is_authenticated(session: Optional[str] = Cookie(default=None)) -> bool:
+    return session is not None and session in _sessions
+
+
+# ── login ─────────────────────────────────────────────────────────────────────
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(error: str = ""):
+    err_html = f'<p class="error">{error}</p>' if error else ""
+    return HTMLResponse(_LOGIN_HTML.replace("<!-- ERROR -->", err_html))
+
+
+@app.post("/login")
+async def login_submit(password: str = Form(...)):
+    if password == DASHBOARD_PASSWORD:
+        token = secrets.token_hex(32)
+        _sessions.add(token)
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie("session", token, httponly=True, samesite="lax", max_age=86400 * 30)
+        return resp
+    return RedirectResponse("/login?error=Invalid+password", status_code=303)
+
+
+@app.post("/logout")
+async def logout(session: Optional[str] = Cookie(default=None)):
+    if session:
+        _sessions.discard(session)
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie("session")
+    return resp
+
+
 # ── dashboard ────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    """Simple management dashboard."""
+async def dashboard(authenticated: bool = Depends(_is_authenticated)):
+    if not authenticated:
+        return RedirectResponse("/login", status_code=303)
 
     def fmt_size(b: int) -> str:
         for unit in ("B", "KB", "MB", "GB"):
             if b < 1024:
                 return f"{b:.1f} {unit}"
-            b /= 1024
+            b /= 1024  # type: ignore[assignment]
         return f"{b:.1f} TB"
 
     def dir_size(path: Path) -> int:
         return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
-    # Named assets
     named_dir = UPLOAD_DIR / "_named"
     named_assets = []
-    for f in sorted(named_dir.iterdir()) if named_dir.exists() else []:
+    for f in (sorted(named_dir.iterdir(), key=lambda x: x.name) if named_dir.exists() else []):
         if f.is_file():
             stat = f.stat()
-            named_assets.append({
-                "name": f.stem,
-                "ext": f.suffix,
-                "size": fmt_size(stat.st_size),
-                "modified": stat.st_mtime,
-            })
+            named_assets.append({"name": f.stem, "ext": f.suffix, "size": fmt_size(stat.st_size)})
 
-    # Recent uploads (top-level files, newest first, skip internal dirs)
-    recent = []
-    for f in sorted(UPLOAD_DIR.iterdir(), key=lambda x: x.stat().st_mtime if x.is_file() else 0, reverse=True):
-        if f.is_file() and not f.name.startswith("_"):
-            stat = f.stat()
-            recent.append({"name": f.name, "size": fmt_size(stat.st_size)})
-        if len(recent) >= 10:
-            break
-
-    # Composites
-    comp_dir = UPLOAD_DIR / "_composite"
-    composites = []
-    if comp_dir.exists():
-        for f in sorted(comp_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True)[:5]:
-            stat = f.stat()
-            composites.append({"name": f.name, "size": fmt_size(stat.st_size), "url": f"{BASE_URL}/files/_composite/{f.name}"})
-
-    # Storage totals
-    total_bytes = dir_size(UPLOAD_DIR) if UPLOAD_DIR.exists() else 0
-
-    named_rows = "".join(
-        f"""<tr>
-          <td><strong>{a['name']}</strong>{a['ext']}</td>
-          <td>{a['size']}</td>
-          <td><span class="badge ok">Uploaded</span></td>
-          <td>
-            <form method="post" action="/upload" enctype="multipart/form-data" style="display:inline">
-              <input type="hidden" name="name" value="{a['name']}">
-              <input type="file" name="file" required style="font-size:12px">
-              <button type="submit" class="btn-sm">Replace</button>
-            </form>
-          </td>
-        </tr>"""
-        for a in named_assets
-    )
-
-    # Expected named assets
     expected = {"faceintro", "video"}
     found_names = {a["name"] for a in named_assets}
     missing = expected - found_names
-    missing_rows = "".join(
-        f"""<tr>
-          <td><strong>{name}</strong></td>
-          <td>—</td>
-          <td><span class="badge missing">Missing</span></td>
-          <td>
-            <form method="post" action="/upload" enctype="multipart/form-data" style="display:inline">
-              <input type="hidden" name="name" value="{name}">
-              <input type="file" name="file" required style="font-size:12px">
-              <button type="submit" class="btn-sm">Upload</button>
-            </form>
-          </td>
-        </tr>"""
-        for name in sorted(missing)
+
+    # All uploads (non-internal), newest first
+    all_files = []
+    for root, dirs, files in os.walk(UPLOAD_DIR):
+        dirs[:] = [d for d in dirs if not d.startswith("_")]
+        for fn in files:
+            fp = Path(root) / fn
+            stat = fp.stat()
+            rel = fp.relative_to(UPLOAD_DIR)
+            ext = fp.suffix.lower()
+            is_video = ext in (".mp4", ".webm", ".mov", ".avi", ".mkv")
+            is_image = ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")
+            all_files.append({
+                "path": str(rel), "name": fn,
+                "size": fmt_size(stat.st_size), "mtime": stat.st_mtime,
+                "url": f"{BASE_URL}/files/{rel}",
+                "is_video": is_video, "is_image": is_image,
+            })
+    all_files.sort(key=lambda x: x["mtime"], reverse=True)
+
+    comp_dir = UPLOAD_DIR / "_composite"
+    composites = []
+    if comp_dir.exists():
+        for f in sorted(comp_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True)[:24]:
+            stat = f.stat()
+            composites.append({"name": f.name, "size": fmt_size(stat.st_size),
+                                "url": f"{BASE_URL}/files/_composite/{f.name}"})
+
+    total_bytes = dir_size(UPLOAD_DIR) if UPLOAD_DIR.exists() else 0
+
+    # Named asset rows
+    named_rows = ""
+    for name in sorted(missing):
+        named_rows += f"""
+        <div class="asset-row missing-asset">
+          <div class="asset-icon">&#128249;</div>
+          <div class="asset-meta">
+            <span class="asset-name">{name}</span>
+            <span class="asset-tag missing-tag">Missing</span>
+          </div>
+          <form method="post" action="/ui/upload-named" enctype="multipart/form-data" class="asset-form">
+            <input type="hidden" name="name" value="{name}">
+            <label class="file-label">Choose file <input type="file" name="file" required></label>
+            <button type="submit" class="btn-primary btn-sm">Upload</button>
+          </form>
+        </div>"""
+    for a in named_assets:
+        named_rows += f"""
+        <div class="asset-row">
+          <div class="asset-icon">&#127910;</div>
+          <div class="asset-meta">
+            <span class="asset-name">{a['name']}{a['ext']}</span>
+            <span class="asset-tag ok-tag">Ready</span>
+            <span class="asset-size">{a['size']}</span>
+          </div>
+          <form method="post" action="/ui/upload-named" enctype="multipart/form-data" class="asset-form">
+            <input type="hidden" name="name" value="{a['name']}">
+            <label class="file-label">Replace <input type="file" name="file" required></label>
+            <button type="submit" class="btn-outline btn-sm">Replace</button>
+          </form>
+        </div>"""
+
+    def media_card(f: dict) -> str:
+        if f["is_video"]:
+            thumb = f'<div class="thumb-wrap"><video src="{f["url"]}" class="thumb-media" muted preload="metadata"></video><span class="media-badge">MP4</span></div>'
+        elif f["is_image"]:
+            thumb = f'<div class="thumb-wrap"><img src="{f["url"]}" class="thumb-media" loading="lazy"></div>'
+        else:
+            thumb = '<div class="thumb-wrap thumb-file"><span>&#128196;</span></div>'
+        name = f["name"]
+        short = (name[:26] + "…") if len(name) > 26 else name
+        return f'<div class="media-card"><a href="{f["url"]}" target="_blank">{thumb}</a><div class="media-info"><span class="media-name" title="{name}">{short}</span><span class="media-size">{f["size"]}</span></div></div>'
+
+    media_grid = "".join(media_card(f) for f in all_files[:48]) or '<p class="empty-state">No uploads yet</p>'
+    comp_grid = "".join(
+        f'<div class="media-card"><a href="{c["url"]}" target="_blank"><div class="thumb-wrap"><video src="{c["url"]}" class="thumb-media" muted preload="metadata"></video><span class="media-badge">composite</span></div></a><div class="media-info"><span class="media-name">{c["name"][:26]}</span><span class="media-size">{c["size"]}</span></div></div>'
+        for c in composites
+    ) or '<p class="empty-state">No composites yet</p>'
+
+    total_str = fmt_size(total_bytes)
+    upload_count = str(len(all_files))
+    comp_count = str(len(composites))
+
+    return HTMLResponse(
+        _DASHBOARD_HTML
+        .replace("%%NAMED_ROWS%%", named_rows)
+        .replace("%%MEDIA_GRID%%", media_grid)
+        .replace("%%COMP_GRID%%", comp_grid)
+        .replace("%%TOTAL%%", total_str)
+        .replace("%%UPLOADS%%", upload_count)
+        .replace("%%COMPS%%", comp_count)
     )
 
-    recent_rows = "".join(
-        f"<tr><td>{r['name']}</td><td>{r['size']}</td></tr>"
-        for r in recent
-    ) or "<tr><td colspan='2' style='color:#888'>No uploads yet</td></tr>"
 
-    composite_rows = "".join(
-        f"<tr><td><a href='{c['url']}' target='_blank'>{c['name']}</a></td><td>{c['size']}</td></tr>"
-        for c in composites
-    ) or "<tr><td colspan='2' style='color:#888'>No composites yet</td></tr>"
+# ── UI upload helper (named assets from dashboard) ────────────────────────────
 
-    html = f"""<!DOCTYPE html>
+@app.post("/ui/upload-named")
+async def ui_upload_named(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    authenticated: bool = Depends(_is_authenticated),
+):
+    if not authenticated:
+        raise HTTPException(401)
+    ext = Path(file.filename or "file").suffix.lower() or ".bin"
+    save_dir = UPLOAD_DIR / "_named"
+    for old in save_dir.glob(f"{name}.*"):
+        old.unlink(missing_ok=True)
+    file_path = save_dir / f"{name}{ext}"
+    async with aiofiles.open(file_path, "wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            await f.write(chunk)
+    return RedirectResponse("/", status_code=303)
+
+
+# ── HTML templates ─────────────────────────────────────────────────────────────
+
+_LOGIN_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Media Processor — Sign in</title>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:#f0f4f8;min-height:100vh;display:flex;flex-direction:column;
+         align-items:center;justify-content:center}
+    .logo-row{display:flex;align-items:center;gap:10px;margin-bottom:28px}
+    .logo-icon{width:40px;height:40px;background:linear-gradient(135deg,#3448c5,#5b6df8);
+               border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px}
+    .logo-text{font-size:22px;font-weight:700;color:#1a202c}
+    .card{background:#fff;border-radius:12px;
+          box-shadow:0 4px 24px rgba(0,0,0,.10),0 1px 4px rgba(0,0,0,.06);
+          padding:40px 44px 36px;width:420px}
+    .card h2{font-size:22px;font-weight:700;color:#1a202c;text-align:center;margin-bottom:28px}
+    label{display:block;font-size:13px;font-weight:600;color:#4a5568;margin-bottom:6px;margin-top:18px}
+    input[type=password]{width:100%;padding:10px 14px;border:1.5px solid #cbd5e0;border-radius:7px;
+                         font-size:15px;color:#1a202c;outline:none;transition:border-color .15s}
+    input[type=password]:focus{border-color:#3448c5;box-shadow:0 0 0 3px rgba(52,72,197,.12)}
+    button[type=submit]{margin-top:24px;width:100%;background:#3448c5;color:#fff;border:none;
+                        border-radius:7px;padding:12px;font-size:14px;font-weight:700;
+                        letter-spacing:.04em;cursor:pointer;text-transform:uppercase;transition:background .15s}
+    button[type=submit]:hover{background:#2a3aaa}
+    .error{background:#fff5f5;border:1px solid #feb2b2;color:#c53030;border-radius:7px;
+           padding:10px 14px;font-size:13px;text-align:center;margin-bottom:8px}
+    .hint{text-align:center;margin-top:18px;font-size:12px;color:#a0aec0}
+  </style>
+</head>
+<body>
+  <div class="logo-row">
+    <div class="logo-icon">&#127916;</div>
+    <span class="logo-text">Media Processor</span>
+  </div>
+  <div class="card">
+    <h2>Sign in to your account</h2>
+    <!-- ERROR -->
+    <form method="post" action="/login">
+      <label for="pw">Password</label>
+      <input type="password" id="pw" name="password" autofocus placeholder="Enter your password">
+      <button type="submit">Sign In</button>
+    </form>
+    <p class="hint">Self-hosted media service &middot; Use your API key as password</p>
+  </div>
+</body>
+</html>"""
+
+_DASHBOARD_HTML = """\
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Media Processor</title>
   <style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }}
-    header {{ background: #1a1d27; border-bottom: 1px solid #2d3148; padding: 16px 32px; display: flex; align-items: center; gap: 12px; }}
-    header h1 {{ font-size: 18px; font-weight: 600; }}
-    header .sub {{ color: #888; font-size: 13px; }}
-    .stat-pill {{ background: #252840; border: 1px solid #3a3f5c; border-radius: 8px; padding: 4px 12px; font-size: 12px; color: #a0aec0; }}
-    main {{ padding: 32px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; max-width: 1100px; }}
-    .card {{ background: #1a1d27; border: 1px solid #2d3148; border-radius: 12px; overflow: hidden; }}
-    .card-header {{ padding: 14px 20px; border-bottom: 1px solid #2d3148; font-size: 13px; font-weight: 600; color: #a0aec0; text-transform: uppercase; letter-spacing: .05em; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    td, th {{ padding: 10px 20px; border-bottom: 1px solid #1e2133; text-align: left; }}
-    tr:last-child td {{ border-bottom: none; }}
-    .badge {{ padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }}
-    .badge.ok {{ background: #1a3a2a; color: #48bb78; }}
-    .badge.missing {{ background: #3a1a1a; color: #fc8181; }}
-    .btn-sm {{ background: #3b4fd8; color: #fff; border: none; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; margin-left: 6px; }}
-    .btn-sm:hover {{ background: #4a60f0; }}
-    .full-width {{ grid-column: 1 / -1; }}
-    a {{ color: #7f9cf5; text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:#f7f8fc;color:#2d3748;display:flex;min-height:100vh}
+
+    /* Sidebar */
+    .sidebar{width:220px;min-height:100vh;background:#1c2035;display:flex;
+             flex-direction:column;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto}
+    .sidebar-logo{padding:22px 20px 18px;display:flex;align-items:center;gap:10px;
+                  border-bottom:1px solid #2d3254}
+    .sidebar-logo .icon{width:34px;height:34px;background:linear-gradient(135deg,#3448c5,#5b6df8);
+                        border-radius:8px;display:flex;align-items:center;justify-content:center;
+                        font-size:17px;flex-shrink:0}
+    .sidebar-logo span{font-size:15px;font-weight:700;color:#fff;line-height:1.2}
+    .sidebar-logo small{display:block;font-size:10px;color:#8892b0;font-weight:400}
+    nav{flex:1;padding:14px 0}
+    .nav-section{padding:14px 20px 6px;font-size:10px;font-weight:700;color:#4a5568;
+                 text-transform:uppercase;letter-spacing:.08em}
+    .nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:#a0aec0;
+              font-size:13.5px;font-weight:500;cursor:pointer;text-decoration:none;
+              border-left:3px solid transparent;transition:all .12s}
+    .nav-item:hover{color:#fff;background:rgba(255,255,255,.05)}
+    .nav-item.active{color:#fff;background:rgba(84,100,255,.18);border-left-color:#5464ff}
+    .nav-item .ni{font-size:15px;width:18px;text-align:center}
+    .sidebar-footer{padding:16px 20px;border-top:1px solid #2d3254}
+    .sidebar-footer form button{width:100%;background:transparent;border:1px solid #3d4470;
+                                color:#8892b0;border-radius:6px;padding:7px;font-size:12px;
+                                cursor:pointer;transition:all .12s}
+    .sidebar-footer form button:hover{background:#2d3254;color:#fff}
+
+    /* Main */
+    .main{flex:1;display:flex;flex-direction:column;min-width:0}
+    .topbar{background:#fff;border-bottom:1px solid #e2e8f0;padding:0 32px;height:56px;
+            display:flex;align-items:center;justify-content:space-between;
+            position:sticky;top:0;z-index:10}
+    .topbar h1{font-size:17px;font-weight:700;color:#1a202c}
+    .topbar-right{display:flex;align-items:center;gap:12px}
+    .stat-chip{background:#f0f4ff;border:1px solid #c3cffe;border-radius:20px;padding:4px 12px;
+               font-size:12px;font-weight:600;color:#3448c5}
+    .api-chip{background:#f7f8fc;border:1px solid #e2e8f0;border-radius:20px;padding:4px 12px;
+              font-size:12px;color:#718096}
+    .api-chip a{color:#3448c5;text-decoration:none;font-weight:600}
+
+    /* Content */
+    .content{padding:28px 32px;flex:1}
+
+    /* Stats */
+    .stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:28px}
+    .stat-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;
+               padding:20px 22px;display:flex;align-items:center;gap:16px}
+    .stat-icon{width:44px;height:44px;border-radius:10px;display:flex;align-items:center;
+               justify-content:center;font-size:20px;flex-shrink:0}
+    .stat-icon.blue{background:#ebf0ff}
+    .stat-icon.green{background:#e6ffed}
+    .stat-icon.purple{background:#f3e8ff}
+    .stat-label{font-size:12px;color:#718096;font-weight:500;margin-bottom:3px}
+    .stat-value{font-size:22px;font-weight:700;color:#1a202c}
+
+    /* Named assets */
+    .asset-row{background:#fff;border:1px solid #e2e8f0;border-radius:10px;
+               padding:14px 18px;margin-bottom:8px;display:flex;align-items:center;gap:14px}
+    .asset-row.missing-asset{border-color:#fed7d7;background:#fffafa}
+    .asset-icon{font-size:22px;width:32px;text-align:center;flex-shrink:0}
+    .asset-meta{flex:1;display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap}
+    .asset-name{font-size:14px;font-weight:600;color:#1a202c}
+    .asset-size{font-size:12px;color:#a0aec0}
+    .asset-tag{padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
+    .ok-tag{background:#e6ffed;color:#276749}
+    .missing-tag{background:#fff5f5;color:#c53030}
+    .asset-form{display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}
+    .file-label{font-size:12px;color:#718096;cursor:pointer;background:#f7f8fc;
+                border:1px solid #e2e8f0;border-radius:6px;padding:5px 10px;white-space:nowrap}
+    .file-label input[type=file]{display:none}
+    .btn-primary{background:#3448c5;color:#fff;border:none;border-radius:7px;
+                 padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer;
+                 white-space:nowrap;transition:background .12s}
+    .btn-primary:hover{background:#2a3aaa}
+    .btn-outline{background:transparent;color:#3448c5;border:1.5px solid #3448c5;border-radius:7px;
+                 padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;
+                 white-space:nowrap;transition:all .12s}
+    .btn-outline:hover{background:#ebf0ff}
+
+    /* Media grid */
+    .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
+    .media-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;
+                transition:box-shadow .12s,transform .12s}
+    .media-card:hover{box-shadow:0 4px 16px rgba(0,0,0,.08);transform:translateY(-1px)}
+    .thumb-wrap{width:100%;aspect-ratio:16/9;background:#f0f4f8;position:relative;overflow:hidden;
+                display:flex;align-items:center;justify-content:center}
+    .thumb-media{width:100%;height:100%;object-fit:cover;display:block}
+    .thumb-file{color:#a0aec0;font-size:32px}
+    .media-badge{position:absolute;bottom:5px;right:5px;background:rgba(0,0,0,.55);color:#fff;
+                 font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;text-transform:uppercase}
+    .media-info{padding:8px 10px}
+    .media-name{display:block;font-size:11px;color:#4a5568;font-weight:500;
+                overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .media-size{display:block;font-size:10px;color:#a0aec0;margin-top:2px}
+    .empty-state{color:#a0aec0;font-size:14px;padding:24px 0;text-align:center}
+    a{text-decoration:none;color:inherit}
+
+    /* Section */
+    .section{margin-bottom:32px}
+    .section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+    .section-title{font-size:15px;font-weight:700;color:#1a202c}
+    .section-sub{font-size:12px;color:#a0aec0;margin-left:8px;font-weight:400}
+    .tab-panel{display:none}
+    .tab-panel.active{display:block}
   </style>
 </head>
 <body>
-  <header>
-    <h1>Media Processor</h1>
-    <span class="sub">Self-hosted media service</span>
-    <span class="stat-pill" style="margin-left:auto">Storage: {fmt_size(total_bytes)}</span>
-    <span class="stat-pill"><a href="/docs" style="color:inherit">API Docs</a></span>
-  </header>
-  <main>
-    <div class="card full-width">
-      <div class="card-header">Named Assets</div>
-      <table>
-        <thead><tr><th>Asset</th><th>Size</th><th>Status</th><th>Action</th></tr></thead>
-        <tbody>{missing_rows}{named_rows}</tbody>
-      </table>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <div class="icon">&#127916;</div>
+    <div>
+      <span>Media Processor</span>
+      <small>media.luxeillum.com</small>
     </div>
-    <div class="card">
-      <div class="card-header">Recent Uploads</div>
-      <table>
-        <thead><tr><th>File</th><th>Size</th></tr></thead>
-        <tbody>{recent_rows}</tbody>
-      </table>
+  </div>
+  <nav>
+    <div class="nav-section">Library</div>
+    <a class="nav-item active" href="#" onclick="return showTab('uploads',this)">
+      <span class="ni">&#128247;</span> Media Library
+    </a>
+    <a class="nav-item" href="#" onclick="return showTab('composites',this)">
+      <span class="ni">&#127910;</span> Composites
+    </a>
+    <div class="nav-section">Assets</div>
+    <a class="nav-item" href="#" onclick="return showTab('named',this)">
+      <span class="ni">&#128279;</span> Named Assets
+    </a>
+    <div class="nav-section">Developer</div>
+    <a class="nav-item" href="/docs" target="_blank">
+      <span class="ni">&#128196;</span> API Docs
+    </a>
+  </nav>
+  <div class="sidebar-footer">
+    <form method="post" action="/logout">
+      <button type="submit">Sign out</button>
+    </form>
+  </div>
+</aside>
+
+<div class="main">
+  <div class="topbar">
+    <h1 id="page-title">Media Library</h1>
+    <div class="topbar-right">
+      <span class="stat-chip">&#128190; %%TOTAL%%</span>
+      <span class="api-chip"><a href="/docs" target="_blank">API Docs</a></span>
     </div>
-    <div class="card">
-      <div class="card-header">Recent Composites</div>
-      <table>
-        <thead><tr><th>File</th><th>Size</th></tr></thead>
-        <tbody>{composite_rows}</tbody>
-      </table>
+  </div>
+  <div class="content">
+
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="stat-icon blue">&#128190;</div>
+        <div><div class="stat-label">Total Storage</div><div class="stat-value">%%TOTAL%%</div></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon green">&#128247;</div>
+        <div><div class="stat-label">Uploaded Files</div><div class="stat-value">%%UPLOADS%%</div></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon purple">&#127910;</div>
+        <div><div class="stat-label">Composites</div><div class="stat-value">%%COMPS%%</div></div>
+      </div>
     </div>
-  </main>
+
+    <div id="tab-uploads" class="tab-panel active section">
+      <div class="section-header">
+        <span class="section-title">All Uploads <span class="section-sub">%%UPLOADS%% files</span></span>
+      </div>
+      <div class="media-grid">%%MEDIA_GRID%%</div>
+    </div>
+
+    <div id="tab-composites" class="tab-panel section">
+      <div class="section-header">
+        <span class="section-title">Composites <span class="section-sub">%%COMPS%% videos</span></span>
+      </div>
+      <div class="media-grid">%%COMP_GRID%%</div>
+    </div>
+
+    <div id="tab-named" class="tab-panel section">
+      <div class="section-header">
+        <span class="section-title">Named Assets</span>
+      </div>
+      %%NAMED_ROWS%%
+    </div>
+
+  </div>
+</div>
+
+<script>
+function showTab(name, el) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  el.classList.add('active');
+  const titles = {uploads:'Media Library', composites:'Composites', named:'Named Assets'};
+  document.getElementById('page-title').textContent = titles[name] || 'Media Processor';
+  return false;
+}
+document.addEventListener('change', e => {
+  if (e.target.type === 'file') {
+    const lbl = e.target.closest('label');
+    if (lbl) lbl.childNodes[0].textContent = e.target.files[0]?.name.substring(0,18) || 'Choose file';
+  }
+});
+</script>
 </body>
 </html>"""
-    return HTMLResponse(html)
-
-
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _find_file(public_id: Optional[str]) -> Optional[Path]:
