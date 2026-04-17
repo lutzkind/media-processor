@@ -255,6 +255,7 @@ async def health():
 # ── session store (in-memory, single-node) ───────────────────────────────────
 # Maps session token → True. Cleared on restart; fine for a single-user tool.
 _sessions: set[str] = set()
+DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", API_KEY or "changeme")
 
 
@@ -271,14 +272,14 @@ async def login_page(error: str = ""):
 
 
 @app.post("/login")
-async def login_submit(password: str = Form(...)):
-    if password == DASHBOARD_PASSWORD:
+async def login_submit(username: str = Form(...), password: str = Form(...)):
+    if username == DASHBOARD_USERNAME and password == DASHBOARD_PASSWORD:
         token = secrets.token_hex(32)
         _sessions.add(token)
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie("session", token, httponly=True, samesite="lax", max_age=86400 * 30)
         return resp
-    return RedirectResponse("/login?error=Invalid+password", status_code=303)
+    return RedirectResponse("/login?error=Invalid+credentials", status_code=303)
 
 
 @app.post("/logout")
@@ -455,9 +456,9 @@ _LOGIN_HTML = """\
           padding:40px 44px 36px;width:420px}
     .card h2{font-size:22px;font-weight:700;color:#1a202c;text-align:center;margin-bottom:28px}
     label{display:block;font-size:13px;font-weight:600;color:#4a5568;margin-bottom:6px;margin-top:18px}
-    input[type=password]{width:100%;padding:10px 14px;border:1.5px solid #cbd5e0;border-radius:7px;
-                         font-size:15px;color:#1a202c;outline:none;transition:border-color .15s}
-    input[type=password]:focus{border-color:#3448c5;box-shadow:0 0 0 3px rgba(52,72,197,.12)}
+    input[type=text],input[type=password]{width:100%;padding:10px 14px;border:1.5px solid #cbd5e0;
+                         border-radius:7px;font-size:15px;color:#1a202c;outline:none;transition:border-color .15s}
+    input[type=text]:focus,input[type=password]:focus{border-color:#3448c5;box-shadow:0 0 0 3px rgba(52,72,197,.12)}
     button[type=submit]{margin-top:24px;width:100%;background:#3448c5;color:#fff;border:none;
                         border-radius:7px;padding:12px;font-size:14px;font-weight:700;
                         letter-spacing:.04em;cursor:pointer;text-transform:uppercase;transition:background .15s}
@@ -476,11 +477,13 @@ _LOGIN_HTML = """\
     <h2>Sign in to your account</h2>
     <!-- ERROR -->
     <form method="post" action="/login">
+      <label for="un">Username</label>
+      <input type="text" id="un" name="username" autofocus placeholder="Enter your username" autocomplete="username">
       <label for="pw">Password</label>
-      <input type="password" id="pw" name="password" autofocus placeholder="Enter your password">
+      <input type="password" id="pw" name="password" placeholder="Enter your password" autocomplete="current-password">
       <button type="submit">Sign In</button>
     </form>
-    <p class="hint">Self-hosted media service &middot; Use your API key as password</p>
+    <p class="hint">Self-hosted media service</p>
   </div>
 </body>
 </html>"""
