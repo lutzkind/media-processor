@@ -16,6 +16,7 @@ app = FastAPI(title="Media Processor API")
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/data/uploads"))
 BASE_URL = os.environ.get("BASE_URL", "https://media.luxeillum.com").rstrip("/")
 API_KEY = os.environ.get("API_KEY", "")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
 
 for d in ["_named", "_thumb", "_composite"]:
     (UPLOAD_DIR / d).mkdir(parents=True, exist_ok=True)
@@ -115,7 +116,7 @@ async def get_thumbnail(
 # ── composite ────────────────────────────────────────────────────────────────
 
 class CompositeRequest(BaseModel):
-    base_id: str                  # public_id of the screenshot / base image
+    base_id: str                  # public_id of the screenshot / base video
     overlay_name: str = "faceintro"  # named asset for circular face overlay
     splice_name: str = "video"       # named asset concatenated after the intro
     overlay_w: int = 300
@@ -130,8 +131,8 @@ class CompositeRequest(BaseModel):
 async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
     """
     Build a two-part composite video:
-      Part 1 — screenshot looped for the duration of the overlay video,
-                with the overlay video displayed as a circular picture-in-picture (SE corner).
+      Part 1 — base image or base video with the overlay video displayed
+                as a circular picture-in-picture (SE corner).
       Part 2 — splice video appended with no overlay.
     """
     base_path = _find_file(req.base_id)
@@ -156,7 +157,9 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
     pos_x = f"W-{ow}-{req.overlay_x}"
     pos_y = f"H-{oh}-{req.overlay_y}"
 
-    # ── Part 1: screenshot + circular overlay ──────────────────────────────
+    base_is_image = base_path.suffix.lower() in IMAGE_EXTENSIONS
+
+    # ── Part 1: base media + circular overlay ──────────────────────────────
     # Commas inside geq expressions must be escaped as \, for FFmpeg's filter parser
     filter_p1 = (
         f"[0:v]scale={W}:{H},setsar=1,setpts=PTS-STARTPTS[bg];"
@@ -166,22 +169,30 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
         f"g='g(X\\,Y)':"
         f"b='b(X\\,Y)':"
         f"a='255*lte(sqrt(pow(X-{cx}\\,2)+pow(Y-{cy}\\,2))\\,{r})'[circle];"
-        f"[bg][circle]overlay={pos_x}:{pos_y}[out]"
+        f"[bg][circle]overlay={pos_x}:{pos_y}:eof_action=pass[out]"
     )
 
-    cmd1 = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-i", str(base_path),   # loop the screenshot
-        "-i", str(overlay_path),               # face intro video
+    cmd1 = ["ffmpeg", "-y"]
+    if base_is_image:
+        cmd1.extend(["-loop", "1"])
+    cmd1.extend([
+        "-i", str(base_path),
+        "-i", str(overlay_path),
+        "-f", "lavfi",
+        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-filter_complex", filter_p1,
         "-map", "[out]",
-        "-map", "1:a?",
-        "-shortest",                           # stop when overlay video ends
+        "-map", "2:a",
+    ])
+    if base_is_image:
+        # For still images, stop when the overlay video ends.
+        cmd1.append("-shortest")
+    cmd1.extend([
         "-c:v", "libx264", "-preset", "fast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         str(tmp_part1),
-    ]
+    ])
 
     proc1 = await asyncio.create_subprocess_exec(
         *cmd1, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
