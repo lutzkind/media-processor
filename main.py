@@ -7,7 +7,7 @@ from typing import Optional
 
 import aiofiles
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Media Processor API")
@@ -249,6 +249,165 @@ async def serve_file(file_path: str):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ── dashboard ────────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    """Simple management dashboard."""
+
+    def fmt_size(b: int) -> str:
+        for unit in ("B", "KB", "MB", "GB"):
+            if b < 1024:
+                return f"{b:.1f} {unit}"
+            b /= 1024
+        return f"{b:.1f} TB"
+
+    def dir_size(path: Path) -> int:
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+    # Named assets
+    named_dir = UPLOAD_DIR / "_named"
+    named_assets = []
+    for f in sorted(named_dir.iterdir()) if named_dir.exists() else []:
+        if f.is_file():
+            stat = f.stat()
+            named_assets.append({
+                "name": f.stem,
+                "ext": f.suffix,
+                "size": fmt_size(stat.st_size),
+                "modified": stat.st_mtime,
+            })
+
+    # Recent uploads (top-level files, newest first, skip internal dirs)
+    recent = []
+    for f in sorted(UPLOAD_DIR.iterdir(), key=lambda x: x.stat().st_mtime if x.is_file() else 0, reverse=True):
+        if f.is_file() and not f.name.startswith("_"):
+            stat = f.stat()
+            recent.append({"name": f.name, "size": fmt_size(stat.st_size)})
+        if len(recent) >= 10:
+            break
+
+    # Composites
+    comp_dir = UPLOAD_DIR / "_composite"
+    composites = []
+    if comp_dir.exists():
+        for f in sorted(comp_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True)[:5]:
+            stat = f.stat()
+            composites.append({"name": f.name, "size": fmt_size(stat.st_size), "url": f"{BASE_URL}/files/_composite/{f.name}"})
+
+    # Storage totals
+    total_bytes = dir_size(UPLOAD_DIR) if UPLOAD_DIR.exists() else 0
+
+    named_rows = "".join(
+        f"""<tr>
+          <td><strong>{a['name']}</strong>{a['ext']}</td>
+          <td>{a['size']}</td>
+          <td><span class="badge ok">Uploaded</span></td>
+          <td>
+            <form method="post" action="/upload" enctype="multipart/form-data" style="display:inline">
+              <input type="hidden" name="name" value="{a['name']}">
+              <input type="file" name="file" required style="font-size:12px">
+              <button type="submit" class="btn-sm">Replace</button>
+            </form>
+          </td>
+        </tr>"""
+        for a in named_assets
+    )
+
+    # Expected named assets
+    expected = {"faceintro", "video"}
+    found_names = {a["name"] for a in named_assets}
+    missing = expected - found_names
+    missing_rows = "".join(
+        f"""<tr>
+          <td><strong>{name}</strong></td>
+          <td>—</td>
+          <td><span class="badge missing">Missing</span></td>
+          <td>
+            <form method="post" action="/upload" enctype="multipart/form-data" style="display:inline">
+              <input type="hidden" name="name" value="{name}">
+              <input type="file" name="file" required style="font-size:12px">
+              <button type="submit" class="btn-sm">Upload</button>
+            </form>
+          </td>
+        </tr>"""
+        for name in sorted(missing)
+    )
+
+    recent_rows = "".join(
+        f"<tr><td>{r['name']}</td><td>{r['size']}</td></tr>"
+        for r in recent
+    ) or "<tr><td colspan='2' style='color:#888'>No uploads yet</td></tr>"
+
+    composite_rows = "".join(
+        f"<tr><td><a href='{c['url']}' target='_blank'>{c['name']}</a></td><td>{c['size']}</td></tr>"
+        for c in composites
+    ) or "<tr><td colspan='2' style='color:#888'>No composites yet</td></tr>"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Media Processor</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }}
+    header {{ background: #1a1d27; border-bottom: 1px solid #2d3148; padding: 16px 32px; display: flex; align-items: center; gap: 12px; }}
+    header h1 {{ font-size: 18px; font-weight: 600; }}
+    header .sub {{ color: #888; font-size: 13px; }}
+    .stat-pill {{ background: #252840; border: 1px solid #3a3f5c; border-radius: 8px; padding: 4px 12px; font-size: 12px; color: #a0aec0; }}
+    main {{ padding: 32px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; max-width: 1100px; }}
+    .card {{ background: #1a1d27; border: 1px solid #2d3148; border-radius: 12px; overflow: hidden; }}
+    .card-header {{ padding: 14px 20px; border-bottom: 1px solid #2d3148; font-size: 13px; font-weight: 600; color: #a0aec0; text-transform: uppercase; letter-spacing: .05em; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    td, th {{ padding: 10px 20px; border-bottom: 1px solid #1e2133; text-align: left; }}
+    tr:last-child td {{ border-bottom: none; }}
+    .badge {{ padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }}
+    .badge.ok {{ background: #1a3a2a; color: #48bb78; }}
+    .badge.missing {{ background: #3a1a1a; color: #fc8181; }}
+    .btn-sm {{ background: #3b4fd8; color: #fff; border: none; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; margin-left: 6px; }}
+    .btn-sm:hover {{ background: #4a60f0; }}
+    .full-width {{ grid-column: 1 / -1; }}
+    a {{ color: #7f9cf5; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Media Processor</h1>
+    <span class="sub">Self-hosted media service</span>
+    <span class="stat-pill" style="margin-left:auto">Storage: {fmt_size(total_bytes)}</span>
+    <span class="stat-pill"><a href="/docs" style="color:inherit">API Docs</a></span>
+  </header>
+  <main>
+    <div class="card full-width">
+      <div class="card-header">Named Assets</div>
+      <table>
+        <thead><tr><th>Asset</th><th>Size</th><th>Status</th><th>Action</th></tr></thead>
+        <tbody>{missing_rows}{named_rows}</tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="card-header">Recent Uploads</div>
+      <table>
+        <thead><tr><th>File</th><th>Size</th></tr></thead>
+        <tbody>{recent_rows}</tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="card-header">Recent Composites</div>
+      <table>
+        <thead><tr><th>File</th><th>Size</th></tr></thead>
+        <tbody>{composite_rows}</tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>"""
+    return HTMLResponse(html)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
