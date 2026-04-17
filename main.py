@@ -308,6 +308,7 @@ async def dashboard(authenticated: bool = Depends(_is_authenticated)):
     def dir_size(path: Path) -> int:
         return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
+    # ── named assets ─────────────────────────────────────────────────────────
     named_dir = UPLOAD_DIR / "_named"
     named_assets = []
     for f in (sorted(named_dir.iterdir(), key=lambda x: x.name) if named_dir.exists() else []):
@@ -319,100 +320,148 @@ async def dashboard(authenticated: bool = Depends(_is_authenticated)):
     found_names = {a["name"] for a in named_assets}
     missing = expected - found_names
 
-    # All uploads (non-internal), newest first
+    # ── all uploads, track folders ────────────────────────────────────────────
     all_files = []
-    for root, dirs, files in os.walk(UPLOAD_DIR):
+    folder_counts: dict = {}  # folder_key → file count
+    for root, dirs, files_in in os.walk(UPLOAD_DIR):
         dirs[:] = [d for d in dirs if not d.startswith("_")]
-        for fn in files:
+        rel_root = Path(root).relative_to(UPLOAD_DIR)
+        folder_key = "" if str(rel_root) == "." else str(rel_root)
+        fc = 0
+        for fn in files_in:
             fp = Path(root) / fn
             stat = fp.stat()
             rel = fp.relative_to(UPLOAD_DIR)
             ext = fp.suffix.lower()
             is_video = ext in (".mp4", ".webm", ".mov", ".avi", ".mkv")
             is_image = ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")
+            pid = str(rel.with_suffix(""))   # public_id without extension
+            url = f"{BASE_URL}/files/{rel}"
             all_files.append({
-                "path": str(rel), "name": fn,
+                "path": str(rel), "name": fn, "folder": folder_key,
                 "size": fmt_size(stat.st_size), "mtime": stat.st_mtime,
-                "url": f"{BASE_URL}/files/{rel}",
+                "url": url, "pid": pid, "ext": ext.lstrip("."),
                 "is_video": is_video, "is_image": is_image,
             })
+            fc += 1
+        folder_counts[folder_key] = folder_counts.get(folder_key, 0) + fc
     all_files.sort(key=lambda x: x["mtime"], reverse=True)
 
+    # ── composites ───────────────────────────────────────────────────────────
     comp_dir = UPLOAD_DIR / "_composite"
     composites = []
     if comp_dir.exists():
-        for f in sorted(comp_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True)[:24]:
+        for f in sorted(comp_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True)[:48]:
             stat = f.stat()
-            composites.append({"name": f.name, "size": fmt_size(stat.st_size),
-                                "url": f"{BASE_URL}/files/_composite/{f.name}"})
+            url = f"{BASE_URL}/files/_composite/{f.name}"
+            pid = f"_composite/{f.stem}"
+            composites.append({"name": f.name, "size": fmt_size(stat.st_size), "url": url, "pid": pid})
 
     total_bytes = dir_size(UPLOAD_DIR) if UPLOAD_DIR.exists() else 0
 
-    # Named asset rows
+    # ── build folder sidebar ──────────────────────────────────────────────────
+    folder_nav = '<a class="nav-item active" href="#" onclick="filterFolder(\'\',this)"><span class="ni">&#128248;</span>All Files<span class="folder-count">' + str(len(all_files)) + '</span></a>'
+    for fk in sorted(folder_counts):
+        if fk == "":
+            continue
+        label = fk
+        cnt = folder_counts[fk]
+        escaped = fk.replace("'", "\\'")
+        folder_nav += f'<a class="nav-item" href="#" onclick="filterFolder(\'{escaped}\',this)"><span class="ni">&#128193;</span>{label}<span class="folder-count">{cnt}</span></a>'
+
+    # ── folder options for upload modal ───────────────────────────────────────
+    folder_opts = '<option value="">Root</option>'
+    for fk in sorted(folder_counts):
+        if fk:
+            folder_opts += f'<option value="{fk}">{fk}</option>'
+    folder_opts += '<option value="__new__">+ New folder…</option>'
+
+    # ── named asset rows ──────────────────────────────────────────────────────
     named_rows = ""
     for name in sorted(missing):
-        named_rows += f"""
-        <div class="asset-row missing-asset">
+        named_rows += f"""<div class="asset-row missing-asset">
           <div class="asset-icon">&#128249;</div>
-          <div class="asset-meta">
-            <span class="asset-name">{name}</span>
-            <span class="asset-tag missing-tag">Missing</span>
-          </div>
+          <div class="asset-meta"><span class="asset-name">{name}</span><span class="asset-tag missing-tag">Missing</span></div>
           <form method="post" action="/ui/upload-named" enctype="multipart/form-data" class="asset-form">
             <input type="hidden" name="name" value="{name}">
-            <label class="file-label">Choose file <input type="file" name="file" required></label>
+            <label class="file-label">Choose file<input type="file" name="file" required></label>
             <button type="submit" class="btn-primary btn-sm">Upload</button>
-          </form>
-        </div>"""
+          </form></div>"""
     for a in named_assets:
-        named_rows += f"""
-        <div class="asset-row">
+        named_rows += f"""<div class="asset-row">
           <div class="asset-icon">&#127910;</div>
-          <div class="asset-meta">
-            <span class="asset-name">{a['name']}{a['ext']}</span>
-            <span class="asset-tag ok-tag">Ready</span>
-            <span class="asset-size">{a['size']}</span>
-          </div>
+          <div class="asset-meta"><span class="asset-name">{a['name']}{a['ext']}</span><span class="asset-tag ok-tag">Ready</span><span class="asset-size">{a['size']}</span></div>
           <form method="post" action="/ui/upload-named" enctype="multipart/form-data" class="asset-form">
             <input type="hidden" name="name" value="{a['name']}">
-            <label class="file-label">Replace <input type="file" name="file" required></label>
+            <label class="file-label">Replace<input type="file" name="file" required></label>
             <button type="submit" class="btn-outline btn-sm">Replace</button>
-          </form>
-        </div>"""
+          </form></div>"""
 
+    # ── media cards ───────────────────────────────────────────────────────────
     def media_card(f: dict) -> str:
+        badge = f['ext'].upper() if f['ext'] else "FILE"
         if f["is_video"]:
-            thumb = f'<div class="thumb-wrap"><video src="{f["url"]}" class="thumb-media" muted preload="metadata"></video><span class="media-badge">MP4</span></div>'
+            preview = f'<video src="{f["url"]}" class="thumb-media" muted preload="metadata"></video>'
         elif f["is_image"]:
-            thumb = f'<div class="thumb-wrap"><img src="{f["url"]}" class="thumb-media" loading="lazy"></div>'
+            preview = f'<img src="{f["url"]}" class="thumb-media" loading="lazy" alt="">'
         else:
-            thumb = '<div class="thumb-wrap thumb-file"><span>&#128196;</span></div>'
-        name = f["name"]
-        short = (name[:26] + "…") if len(name) > 26 else name
-        return f'<div class="media-card"><a href="{f["url"]}" target="_blank">{thumb}</a><div class="media-info"><span class="media-name" title="{name}">{short}</span><span class="media-size">{f["size"]}</span></div></div>'
+            preview = '<div class="thumb-file">&#128196;</div>'
+        short = (f["name"][:24] + "…") if len(f["name"]) > 24 else f["name"]
+        url_esc = f["url"].replace('"', '&quot;')
+        pid_esc = f["pid"].replace('"', '&quot;').replace("'", "\\'")
+        url_js  = f["url"].replace("'", "\\'")
+        return (
+            f'<div class="media-card" data-folder="{f["folder"]}" data-name="{f["name"].lower()}">'
+            f'<div class="thumb-wrap">'
+            f'{preview}'
+            f'<span class="media-badge">{badge}</span>'
+            f'<div class="card-overlay">'
+            f'<a href="{url_esc}" target="_blank" class="ov-btn ov-open" title="Open">&#10697;</a>'
+            f'<button class="ov-btn ov-url" onclick="cp(\'{url_js}\',this)" title="Copy URL">URL</button>'
+            f'<button class="ov-btn ov-id"  onclick="cp(\'{pid_esc}\',this)" title="Copy public_id">ID</button>'
+            f'<button class="ov-btn ov-del" onclick="del(\'{pid_esc}\',this)" title="Delete">&#128465;</button>'
+            f'</div></div>'
+            f'<div class="media-info"><span class="media-name" title="{f["name"]}">{short}</span>'
+            f'<span class="media-meta">{f["folder"] or "root"} &middot; {f["size"]}</span></div></div>'
+        )
 
-    media_grid = "".join(media_card(f) for f in all_files[:48]) or '<p class="empty-state">No uploads yet</p>'
-    comp_grid = "".join(
-        f'<div class="media-card"><a href="{c["url"]}" target="_blank"><div class="thumb-wrap"><video src="{c["url"]}" class="thumb-media" muted preload="metadata"></video><span class="media-badge">composite</span></div></a><div class="media-info"><span class="media-name">{c["name"][:26]}</span><span class="media-size">{c["size"]}</span></div></div>'
-        for c in composites
-    ) or '<p class="empty-state">No composites yet</p>'
+    media_cards = "".join(media_card(f) for f in all_files) or '<p class="empty-state">No uploads yet</p>'
 
-    total_str = fmt_size(total_bytes)
-    upload_count = str(len(all_files))
-    comp_count = str(len(composites))
+    def comp_card(c: dict) -> str:
+        short = (c["name"][:24] + "…") if len(c["name"]) > 24 else c["name"]
+        url_js = c["url"].replace("'", "\\'")
+        pid_esc = c["pid"].replace("'", "\\'")
+        return (
+            f'<div class="media-card" data-folder="_composite" data-name="{c["name"].lower()}">'
+            f'<div class="thumb-wrap">'
+            f'<video src="{c["url"]}" class="thumb-media" muted preload="metadata"></video>'
+            f'<span class="media-badge">composite</span>'
+            f'<div class="card-overlay">'
+            f'<a href="{c["url"]}" target="_blank" class="ov-btn ov-open" title="Open">&#10697;</a>'
+            f'<button class="ov-btn ov-url" onclick="cp(\'{url_js}\',this)" title="Copy URL">URL</button>'
+            f'<button class="ov-btn ov-id"  onclick="cp(\'{pid_esc}\',this)" title="Copy public_id">ID</button>'
+            f'<button class="ov-btn ov-del" onclick="del(\'{pid_esc}\',this)" title="Delete">&#128465;</button>'
+            f'</div></div>'
+            f'<div class="media-info"><span class="media-name" title="{c["name"]}">{short}</span>'
+            f'<span class="media-meta">composite &middot; {c["size"]}</span></div></div>'
+        )
+
+    comp_cards = "".join(comp_card(c) for c in composites) or '<p class="empty-state">No composites yet</p>'
 
     return HTMLResponse(
         _DASHBOARD_HTML
         .replace("%%NAMED_ROWS%%", named_rows)
-        .replace("%%MEDIA_GRID%%", media_grid)
-        .replace("%%COMP_GRID%%", comp_grid)
-        .replace("%%TOTAL%%", total_str)
-        .replace("%%UPLOADS%%", upload_count)
-        .replace("%%COMPS%%", comp_count)
+        .replace("%%MEDIA_CARDS%%", media_cards)
+        .replace("%%COMP_CARDS%%", comp_cards)
+        .replace("%%TOTAL%%", fmt_size(total_bytes))
+        .replace("%%UPLOADS%%", str(len(all_files)))
+        .replace("%%COMPS%%", str(len(composites)))
+        .replace("%%FOLDER_NAV%%", folder_nav)
+        .replace("%%FOLDER_OPTS%%", folder_opts)
     )
 
 
-# ── UI upload helper (named assets from dashboard) ────────────────────────────
+# ── UI helpers (session-auth) ─────────────────────────────────────────────────
 
 @app.post("/ui/upload-named")
 async def ui_upload_named(
@@ -431,6 +480,48 @@ async def ui_upload_named(
         while chunk := await file.read(1024 * 1024):
             await f.write(chunk)
     return RedirectResponse("/", status_code=303)
+
+
+@app.post("/ui/upload-file")
+async def ui_upload_file(
+    file: UploadFile = File(...),
+    folder: str = Form(""),
+    authenticated: bool = Depends(_is_authenticated),
+):
+    if not authenticated:
+        raise HTTPException(401)
+    ext = Path(file.filename or "file").suffix.lower() or ".bin"
+    raw_id = str(uuid.uuid4())
+    clean_folder = folder.strip().strip("/")
+    if clean_folder:
+        save_dir = UPLOAD_DIR / clean_folder
+        save_dir.mkdir(parents=True, exist_ok=True)
+        public_id = f"{clean_folder}/{raw_id}"
+    else:
+        save_dir = UPLOAD_DIR
+        public_id = raw_id
+    file_path = save_dir / f"{raw_id}{ext}"
+    async with aiofiles.open(file_path, "wb") as fh:
+        while chunk := await file.read(1024 * 1024):
+            await fh.write(chunk)
+    url = f"{BASE_URL}/files/{public_id}{ext}"
+    return {"public_id": public_id, "url": url, "secure_url": url}
+
+
+@app.post("/ui/delete-file")
+async def ui_delete_file(
+    request: Request,
+    authenticated: bool = Depends(_is_authenticated),
+):
+    if not authenticated:
+        raise HTTPException(401)
+    body = await request.json()
+    public_id = body.get("public_id", "")
+    fp = _find_file(public_id)
+    if not fp or not fp.is_file():
+        raise HTTPException(404, "File not found")
+    fp.unlink()
+    return {"deleted": public_id}
 
 
 # ── HTML templates ─────────────────────────────────────────────────────────────
@@ -500,68 +591,75 @@ _DASHBOARD_HTML = """\
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
          background:#f7f8fc;color:#2d3748;display:flex;min-height:100vh}
 
-    /* Sidebar */
-    .sidebar{width:220px;min-height:100vh;background:#1c2035;display:flex;
+    /* ── Sidebar ── */
+    .sidebar{width:230px;min-height:100vh;background:#1c2035;display:flex;
              flex-direction:column;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto}
-    .sidebar-logo{padding:22px 20px 18px;display:flex;align-items:center;gap:10px;
+    .sidebar-logo{padding:20px 18px 16px;display:flex;align-items:center;gap:10px;
                   border-bottom:1px solid #2d3254}
-    .sidebar-logo .icon{width:34px;height:34px;background:linear-gradient(135deg,#3448c5,#5b6df8);
+    .sidebar-logo .icon{width:32px;height:32px;background:linear-gradient(135deg,#3448c5,#5b6df8);
                         border-radius:8px;display:flex;align-items:center;justify-content:center;
-                        font-size:17px;flex-shrink:0}
-    .sidebar-logo span{font-size:15px;font-weight:700;color:#fff;line-height:1.2}
+                        font-size:16px;flex-shrink:0}
+    .sidebar-logo span{font-size:14px;font-weight:700;color:#fff;line-height:1.2}
     .sidebar-logo small{display:block;font-size:10px;color:#8892b0;font-weight:400}
-    nav{flex:1;padding:14px 0}
-    .nav-section{padding:14px 20px 6px;font-size:10px;font-weight:700;color:#4a5568;
+    nav{flex:1;padding:10px 0}
+    .nav-section{padding:12px 18px 4px;font-size:10px;font-weight:700;color:#4a5568;
                  text-transform:uppercase;letter-spacing:.08em}
-    .nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:#a0aec0;
-              font-size:13.5px;font-weight:500;cursor:pointer;text-decoration:none;
-              border-left:3px solid transparent;transition:all .12s}
+    .nav-item{display:flex;align-items:center;gap:8px;padding:8px 18px;color:#a0aec0;
+              font-size:13px;font-weight:500;cursor:pointer;text-decoration:none;
+              border-left:3px solid transparent;transition:all .12s;white-space:nowrap;overflow:hidden}
     .nav-item:hover{color:#fff;background:rgba(255,255,255,.05)}
     .nav-item.active{color:#fff;background:rgba(84,100,255,.18);border-left-color:#5464ff}
-    .nav-item .ni{font-size:15px;width:18px;text-align:center}
-    .sidebar-footer{padding:16px 20px;border-top:1px solid #2d3254}
+    .nav-item .ni{font-size:14px;width:18px;text-align:center;flex-shrink:0}
+    .folder-count{margin-left:auto;background:rgba(255,255,255,.1);border-radius:10px;
+                  padding:1px 7px;font-size:10px;font-weight:700;flex-shrink:0}
+    .sidebar-footer{padding:14px 18px;border-top:1px solid #2d3254}
     .sidebar-footer form button{width:100%;background:transparent;border:1px solid #3d4470;
                                 color:#8892b0;border-radius:6px;padding:7px;font-size:12px;
                                 cursor:pointer;transition:all .12s}
     .sidebar-footer form button:hover{background:#2d3254;color:#fff}
 
-    /* Main */
+    /* ── Main ── */
     .main{flex:1;display:flex;flex-direction:column;min-width:0}
-    .topbar{background:#fff;border-bottom:1px solid #e2e8f0;padding:0 32px;height:56px;
-            display:flex;align-items:center;justify-content:space-between;
-            position:sticky;top:0;z-index:10}
-    .topbar h1{font-size:17px;font-weight:700;color:#1a202c}
-    .topbar-right{display:flex;align-items:center;gap:12px}
-    .stat-chip{background:#f0f4ff;border:1px solid #c3cffe;border-radius:20px;padding:4px 12px;
-               font-size:12px;font-weight:600;color:#3448c5}
+    .topbar{background:#fff;border-bottom:1px solid #e2e8f0;padding:0 24px;height:56px;
+            display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:10}
+    .topbar h1{font-size:16px;font-weight:700;color:#1a202c;margin-right:auto}
+    .search-wrap{position:relative}
+    .search-wrap input{padding:7px 10px 7px 32px;border:1.5px solid #e2e8f0;border-radius:7px;
+                       font-size:13px;color:#2d3748;outline:none;width:220px;transition:border-color .15s}
+    .search-wrap input:focus{border-color:#3448c5}
+    .search-wrap::before{content:"\\1F50D";position:absolute;left:9px;top:50%;transform:translateY(-50%);
+                          font-size:13px;pointer-events:none;color:#a0aec0}
+    .btn-upload{background:#3448c5;color:#fff;border:none;border-radius:7px;padding:8px 16px;
+                font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;transition:background .12s}
+    .btn-upload:hover{background:#2a3aaa}
     .api-chip{background:#f7f8fc;border:1px solid #e2e8f0;border-radius:20px;padding:4px 12px;
               font-size:12px;color:#718096}
     .api-chip a{color:#3448c5;text-decoration:none;font-weight:600}
 
-    /* Content */
-    .content{padding:28px 32px;flex:1}
+    /* ── Content ── */
+    .content{padding:24px;flex:1}
 
-    /* Stats */
-    .stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:28px}
+    /* ── Stats ── */
+    .stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:24px}
     .stat-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;
-               padding:20px 22px;display:flex;align-items:center;gap:16px}
-    .stat-icon{width:44px;height:44px;border-radius:10px;display:flex;align-items:center;
-               justify-content:center;font-size:20px;flex-shrink:0}
+               padding:18px 20px;display:flex;align-items:center;gap:14px}
+    .stat-icon{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;
+               justify-content:center;font-size:18px;flex-shrink:0}
     .stat-icon.blue{background:#ebf0ff}
     .stat-icon.green{background:#e6ffed}
     .stat-icon.purple{background:#f3e8ff}
-    .stat-label{font-size:12px;color:#718096;font-weight:500;margin-bottom:3px}
-    .stat-value{font-size:22px;font-weight:700;color:#1a202c}
+    .stat-label{font-size:11px;color:#718096;font-weight:500;margin-bottom:2px}
+    .stat-value{font-size:20px;font-weight:700;color:#1a202c}
 
-    /* Named assets */
+    /* ── Named assets ── */
     .asset-row{background:#fff;border:1px solid #e2e8f0;border-radius:10px;
-               padding:14px 18px;margin-bottom:8px;display:flex;align-items:center;gap:14px}
+               padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:12px}
     .asset-row.missing-asset{border-color:#fed7d7;background:#fffafa}
-    .asset-icon{font-size:22px;width:32px;text-align:center;flex-shrink:0}
-    .asset-meta{flex:1;display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap}
-    .asset-name{font-size:14px;font-weight:600;color:#1a202c}
-    .asset-size{font-size:12px;color:#a0aec0}
-    .asset-tag{padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
+    .asset-icon{font-size:20px;width:28px;text-align:center;flex-shrink:0}
+    .asset-meta{flex:1;display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}
+    .asset-name{font-size:13px;font-weight:600;color:#1a202c}
+    .asset-size{font-size:11px;color:#a0aec0}
+    .asset-tag{padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700}
     .ok-tag{background:#e6ffed;color:#276749}
     .missing-tag{background:#fff5f5;color:#c53030}
     .asset-form{display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}
@@ -577,77 +675,116 @@ _DASHBOARD_HTML = """\
                  white-space:nowrap;transition:all .12s}
     .btn-outline:hover{background:#ebf0ff}
 
-    /* Media grid */
-    .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
+    /* ── Media grid ── */
+    .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
     .media-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;
-                transition:box-shadow .12s,transform .12s}
-    .media-card:hover{box-shadow:0 4px 16px rgba(0,0,0,.08);transform:translateY(-1px)}
+                transition:box-shadow .12s,transform .12s;position:relative}
+    .media-card:hover{box-shadow:0 4px 18px rgba(0,0,0,.10);transform:translateY(-1px)}
+    .media-card.hidden{display:none}
     .thumb-wrap{width:100%;aspect-ratio:16/9;background:#f0f4f8;position:relative;overflow:hidden;
                 display:flex;align-items:center;justify-content:center}
     .thumb-media{width:100%;height:100%;object-fit:cover;display:block}
-    .thumb-file{color:#a0aec0;font-size:32px}
-    .media-badge{position:absolute;bottom:5px;right:5px;background:rgba(0,0,0,.55);color:#fff;
-                 font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;text-transform:uppercase}
-    .media-info{padding:8px 10px}
-    .media-name{display:block;font-size:11px;color:#4a5568;font-weight:500;
+    .thumb-file{color:#a0aec0;font-size:30px}
+    .media-badge{position:absolute;bottom:5px;left:6px;background:rgba(0,0,0,.55);color:#fff;
+                 font-size:9px;font-weight:700;padding:2px 5px;border-radius:4px;text-transform:uppercase}
+    .card-overlay{position:absolute;inset:0;background:rgba(20,25,50,.72);
+                  display:flex;align-items:center;justify-content:center;gap:6px;
+                  opacity:0;transition:opacity .15s;flex-wrap:wrap;padding:6px}
+    .thumb-wrap:hover .card-overlay{opacity:1}
+    .ov-btn{background:rgba(255,255,255,.18);color:#fff;border:1px solid rgba(255,255,255,.3);
+            border-radius:6px;padding:5px 9px;font-size:11px;font-weight:700;cursor:pointer;
+            text-decoration:none;transition:background .1s;white-space:nowrap}
+    .ov-btn:hover{background:rgba(255,255,255,.32)}
+    .ov-del{background:rgba(220,50,50,.4);border-color:rgba(220,50,50,.6)}
+    .ov-del:hover{background:rgba(220,50,50,.7)}
+    .media-info{padding:7px 9px}
+    .media-name{display:block;font-size:11px;color:#4a5568;font-weight:600;
                 overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .media-size{display:block;font-size:10px;color:#a0aec0;margin-top:2px}
-    .empty-state{color:#a0aec0;font-size:14px;padding:24px 0;text-align:center}
+    .media-meta{display:block;font-size:10px;color:#a0aec0;margin-top:1px}
+    .empty-state{color:#a0aec0;font-size:14px;padding:32px 0;text-align:center;grid-column:1/-1}
     a{text-decoration:none;color:inherit}
 
-    /* Section */
-    .section{margin-bottom:32px}
-    .section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-    .section-title{font-size:15px;font-weight:700;color:#1a202c}
+    /* ── Section ── */
+    .section{margin-bottom:28px}
+    .section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+    .section-title{font-size:14px;font-weight:700;color:#1a202c}
     .section-sub{font-size:12px;color:#a0aec0;margin-left:8px;font-weight:400}
     .tab-panel{display:none}
     .tab-panel.active{display:block}
+
+    /* ── Upload modal ── */
+    .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100;
+              align-items:center;justify-content:center}
+    .modal-bg.open{display:flex}
+    .modal{background:#fff;border-radius:14px;padding:28px 32px;width:420px;max-width:95vw;
+           box-shadow:0 20px 60px rgba(0,0,0,.25)}
+    .modal h2{font-size:17px;font-weight:700;color:#1a202c;margin-bottom:20px}
+    .drop-zone{border:2px dashed #cbd5e0;border-radius:10px;padding:32px;text-align:center;
+               cursor:pointer;transition:border-color .15s,background .15s;margin-bottom:16px}
+    .drop-zone.drag-over{border-color:#3448c5;background:#f0f4ff}
+    .drop-zone p{font-size:13px;color:#718096;margin-top:6px}
+    .drop-zone .dz-icon{font-size:32px}
+    .modal label{display:block;font-size:12px;font-weight:600;color:#4a5568;margin-bottom:5px;margin-top:14px}
+    .modal select,.modal input[type=text]{width:100%;padding:8px 10px;border:1.5px solid #cbd5e0;
+                                          border-radius:7px;font-size:13px;outline:none;
+                                          transition:border-color .15s}
+    .modal select:focus,.modal input[type=text]:focus{border-color:#3448c5}
+    .modal-footer{display:flex;gap:10px;margin-top:20px;justify-content:flex-end}
+    .btn-cancel{background:transparent;border:1.5px solid #e2e8f0;color:#718096;border-radius:7px;
+                padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}
+    .btn-cancel:hover{background:#f7f8fc}
+    .progress-bar-wrap{height:6px;background:#e2e8f0;border-radius:3px;margin-top:12px;overflow:hidden;display:none}
+    .progress-bar{height:100%;background:#3448c5;border-radius:3px;width:0%;transition:width .2s}
+    #up-file-list{font-size:12px;color:#718096;margin-top:6px;min-height:18px}
+
+    /* ── Toast ── */
+    .toast{position:fixed;bottom:24px;right:24px;background:#1c2035;color:#fff;border-radius:8px;
+           padding:10px 18px;font-size:13px;font-weight:600;z-index:200;
+           opacity:0;transform:translateY(8px);transition:all .2s;pointer-events:none}
+    .toast.show{opacity:1;transform:translateY(0)}
+    .toast.err{background:#c53030}
   </style>
 </head>
 <body>
 
+<!-- ── Sidebar ── -->
 <aside class="sidebar">
   <div class="sidebar-logo">
     <div class="icon">&#127916;</div>
-    <div>
-      <span>Media Processor</span>
-      <small>media.luxeillum.com</small>
-    </div>
+    <div><span>Media Processor</span><small>media.luxeillum.com</small></div>
   </div>
   <nav>
-    <div class="nav-section">Library</div>
-    <a class="nav-item active" href="#" onclick="return showTab('uploads',this)">
-      <span class="ni">&#128247;</span> Media Library
+    <div class="nav-section">Media Library</div>
+    %%FOLDER_NAV%%
+    <div class="nav-section" style="margin-top:6px">Sections</div>
+    <a class="nav-item" href="#" onclick="showSection('composites',this)">
+      <span class="ni">&#127910;</span>Composites<span class="folder-count">%%COMPS%%</span>
     </a>
-    <a class="nav-item" href="#" onclick="return showTab('composites',this)">
-      <span class="ni">&#127910;</span> Composites
+    <a class="nav-item" href="#" onclick="showSection('named',this)">
+      <span class="ni">&#128279;</span>Named Assets
     </a>
-    <div class="nav-section">Assets</div>
-    <a class="nav-item" href="#" onclick="return showTab('named',this)">
-      <span class="ni">&#128279;</span> Named Assets
-    </a>
-    <div class="nav-section">Developer</div>
+    <div class="nav-section" style="margin-top:6px">Developer</div>
     <a class="nav-item" href="/docs" target="_blank">
-      <span class="ni">&#128196;</span> API Docs
+      <span class="ni">&#128196;</span>API Docs
     </a>
   </nav>
   <div class="sidebar-footer">
-    <form method="post" action="/logout">
-      <button type="submit">Sign out</button>
-    </form>
+    <form method="post" action="/logout"><button type="submit">Sign out</button></form>
   </div>
 </aside>
 
+<!-- ── Main ── -->
 <div class="main">
   <div class="topbar">
     <h1 id="page-title">Media Library</h1>
-    <div class="topbar-right">
-      <span class="stat-chip">&#128190; %%TOTAL%%</span>
-      <span class="api-chip"><a href="/docs" target="_blank">API Docs</a></span>
+    <div class="search-wrap">
+      <input type="text" id="search" placeholder="Search files…" oninput="filterSearch(this.value)">
     </div>
+    <button class="btn-upload" onclick="openUpload()">&#8679; Upload</button>
+    <span class="api-chip">&#128190; %%TOTAL%% &nbsp;|&nbsp; <a href="/docs" target="_blank">API</a></span>
   </div>
-  <div class="content">
 
+  <div class="content">
     <div class="stats-row">
       <div class="stat-card">
         <div class="stat-icon blue">&#128190;</div>
@@ -663,44 +800,204 @@ _DASHBOARD_HTML = """\
       </div>
     </div>
 
+    <!-- Media Library -->
     <div id="tab-uploads" class="tab-panel active section">
       <div class="section-header">
-        <span class="section-title">All Uploads <span class="section-sub">%%UPLOADS%% files</span></span>
+        <span class="section-title">All Files <span class="section-sub" id="file-count">%%UPLOADS%% files</span></span>
       </div>
-      <div class="media-grid">%%MEDIA_GRID%%</div>
+      <div class="media-grid" id="media-grid">%%MEDIA_CARDS%%</div>
     </div>
 
+    <!-- Composites -->
     <div id="tab-composites" class="tab-panel section">
       <div class="section-header">
         <span class="section-title">Composites <span class="section-sub">%%COMPS%% videos</span></span>
       </div>
-      <div class="media-grid">%%COMP_GRID%%</div>
+      <div class="media-grid">%%COMP_CARDS%%</div>
     </div>
 
+    <!-- Named Assets -->
     <div id="tab-named" class="tab-panel section">
       <div class="section-header">
-        <span class="section-title">Named Assets</span>
+        <span class="section-title">Named Assets
+          <span class="section-sub">Pre-loaded assets for the composite operation</span>
+        </span>
       </div>
       %%NAMED_ROWS%%
     </div>
-
   </div>
 </div>
 
+<!-- ── Upload Modal ── -->
+<div class="modal-bg" id="upload-modal" onclick="maybeClose(event)">
+  <div class="modal">
+    <h2>&#8679; Upload Files</h2>
+    <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+      <div class="dz-icon">&#128190;</div>
+      <strong>Click or drag &amp; drop files here</strong>
+      <p>Any file type &middot; Multiple files supported</p>
+    </div>
+    <input type="file" id="file-input" multiple style="display:none" onchange="queueFiles(this.files)">
+    <div id="up-file-list"></div>
+    <label for="folder-select">Folder</label>
+    <select id="folder-select" onchange="checkNewFolder(this)">%%FOLDER_OPTS%%</select>
+    <input type="text" id="new-folder-input" placeholder="e.g. prospect" style="display:none;margin-top:8px">
+    <div class="progress-bar-wrap" id="prog-wrap"><div class="progress-bar" id="prog-bar"></div></div>
+    <div class="modal-footer">
+      <button class="btn-cancel" onclick="closeUpload()">Cancel</button>
+      <button class="btn-upload" id="do-upload" onclick="startUpload()">Upload</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Toast ── -->
+<div class="toast" id="toast"></div>
+
 <script>
-function showTab(name, el) {
+// ── Tab / section switching ───────────────────────────────────────────────────
+let currentFolder = '';
+
+function showSection(name, el) {
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
-  el.classList.add('active');
+  if (el) el.classList.add('active');
   const titles = {uploads:'Media Library', composites:'Composites', named:'Named Assets'};
   document.getElementById('page-title').textContent = titles[name] || 'Media Processor';
   return false;
 }
+
+function filterFolder(folder, el) {
+  currentFolder = folder;
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('tab-uploads').classList.add('active');
+  if (el) el.classList.add('active');
+  document.getElementById('page-title').textContent = folder ? folder + '/' : 'All Files';
+  applyFilters();
+  return false;
+}
+
+function applyFilters() {
+  const q = document.getElementById('search').value.toLowerCase();
+  let vis = 0;
+  document.querySelectorAll('#media-grid .media-card').forEach(c => {
+    const matchF = !currentFolder || c.dataset.folder === currentFolder;
+    const matchQ = !q || c.dataset.name.includes(q);
+    const hide = !(matchF && matchQ);
+    c.classList.toggle('hidden', hide);
+    if (!hide) vis++;
+  });
+  const sub = document.getElementById('file-count');
+  if (sub) sub.textContent = vis + ' file' + (vis !== 1 ? 's' : '');
+}
+
+function filterSearch(q) { applyFilters(); }
+
+// ── Copy / delete ─────────────────────────────────────────────────────────────
+function cp(text, btn) {
+  navigator.clipboard.writeText(text).then(() => toast('Copied!'));
+}
+
+function del(pid, btn) {
+  if (!confirm('Delete "' + pid + '"?')) return;
+  fetch('/ui/delete-file', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({public_id: pid})
+  }).then(r => {
+    if (r.ok) {
+      const card = btn.closest('.media-card');
+      card.style.transition = 'opacity .2s';
+      card.style.opacity = '0';
+      setTimeout(() => { card.remove(); applyFilters(); }, 200);
+      toast('Deleted');
+    } else {
+      r.json().then(d => toast(d.detail || 'Delete failed', true));
+    }
+  }).catch(() => toast('Delete failed', true));
+}
+
+// ── Upload modal ──────────────────────────────────────────────────────────────
+let uploadQueue = [];
+
+function openUpload() {
+  document.getElementById('upload-modal').classList.add('open');
+  uploadQueue = [];
+  document.getElementById('up-file-list').textContent = '';
+  document.getElementById('prog-wrap').style.display = 'none';
+  document.getElementById('prog-bar').style.width = '0%';
+}
+function closeUpload() { document.getElementById('upload-modal').classList.remove('open'); }
+function maybeClose(e) { if (e.target.id === 'upload-modal') closeUpload(); }
+
+function checkNewFolder(sel) {
+  document.getElementById('new-folder-input').style.display =
+    sel.value === '__new__' ? 'block' : 'none';
+}
+
+function queueFiles(files) {
+  uploadQueue = Array.from(files);
+  document.getElementById('up-file-list').textContent =
+    uploadQueue.map(f => f.name).join(', ').substring(0, 120) +
+    (uploadQueue.length > 3 ? ` (+${uploadQueue.length - 3} more)` : '');
+}
+
+// drag & drop
+const dz = document.getElementById('drop-zone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('drag-over');
+  queueFiles(e.dataTransfer.files);
+});
+
+async function startUpload() {
+  if (!uploadQueue.length) { toast('Select at least one file', true); return; }
+  const selEl = document.getElementById('folder-select');
+  let folder = selEl.value === '__new__'
+    ? document.getElementById('new-folder-input').value.trim()
+    : selEl.value;
+
+  const btn = document.getElementById('do-upload');
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  const wrap = document.getElementById('prog-wrap');
+  const bar  = document.getElementById('prog-bar');
+  wrap.style.display = 'block';
+
+  let done = 0;
+  for (const file of uploadQueue) {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('folder', folder);
+    try {
+      const r = await fetch('/ui/upload-file', { method: 'POST', body: fd });
+      if (!r.ok) { const d = await r.json(); toast(d.detail || 'Upload failed', true); }
+    } catch { toast('Upload failed', true); }
+    done++;
+    bar.style.width = (done / uploadQueue.length * 100) + '%';
+  }
+
+  btn.disabled = false; btn.textContent = 'Upload';
+  toast(done + ' file' + (done !== 1 ? 's' : '') + ' uploaded — reloading…');
+  setTimeout(() => location.reload(), 900);
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+let _tid;
+function toast(msg, err) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (err ? ' err' : '');
+  clearTimeout(_tid);
+  _tid = setTimeout(() => el.classList.remove('show'), 2400);
+}
+
+// ── Named asset file-label update ─────────────────────────────────────────────
 document.addEventListener('change', e => {
   if (e.target.type === 'file') {
     const lbl = e.target.closest('label');
-    if (lbl) lbl.childNodes[0].textContent = e.target.files[0]?.name.substring(0,18) || 'Choose file';
+    if (lbl) lbl.childNodes[0].textContent = e.target.files[0]?.name.substring(0,18) || 'Choose';
   }
 });
 </script>
