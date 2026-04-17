@@ -184,9 +184,9 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
         "-map", "[out]",
         "-map", "2:a",
     ])
-    if base_is_image:
-        # For still images, stop when the overlay video ends.
-        cmd1.append("-shortest")
+    # Stop when the composed video stream ends. This keeps synthetic audio
+    # from making ffmpeg run forever for silent base videos.
+    cmd1.append("-shortest")
     cmd1.extend([
         "-c:v", "libx264", "-preset", "fast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k",
