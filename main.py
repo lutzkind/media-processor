@@ -119,10 +119,10 @@ class CompositeRequest(BaseModel):
     base_id: str                  # public_id of the screenshot / base video
     overlay_name: str = "faceintro"  # named asset for circular face overlay
     splice_name: str = "video"       # named asset concatenated after the intro
-    overlay_w: int = 300
-    overlay_h: int = 300
-    overlay_x: int = 60           # px offset from SE edge
-    overlay_y: int = 60
+    overlay_w: int = 220
+    overlay_h: int = 220
+    overlay_x: int = 48           # px offset from SE edge
+    overlay_y: int = 48
     output_w: int = 1280
     output_h: int = 720
 
@@ -163,7 +163,8 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
     # Commas inside geq expressions must be escaped as \, for FFmpeg's filter parser
     filter_p1 = (
         f"[0:v]scale={W}:{H},setsar=1,setpts=PTS-STARTPTS[bg];"
-        f"[1:v]scale={ow}:{oh},setpts=PTS-STARTPTS,format=rgba,"
+        f"[1:v]crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
+        f"scale={ow}:{oh},setpts=PTS-STARTPTS,format=rgba,"
         f"geq="
         f"r='r(X\\,Y)':"
         f"g='g(X\\,Y)':"
