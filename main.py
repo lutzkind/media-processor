@@ -202,8 +202,8 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
     # Stop when the composed video stream ends.
     cmd1.append("-shortest")
     cmd1.extend([
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "128k",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "24",
+        "-c:a", "aac", "-b:a", "96k",
         "-movflags", "+faststart",
         str(tmp_part1),
     ])
@@ -228,8 +228,8 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
         "-i", str(splice_path),
         "-filter_complex", filter_concat,
         "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "128k",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "24",
+        "-c:a", "aac", "-b:a", "96k",
         "-movflags", "+faststart",
         str(out_path),
     ]
