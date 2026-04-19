@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiofiles
+import boto3
 from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
@@ -17,6 +18,14 @@ UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/data/uploads"))
 BASE_URL = os.environ.get("BASE_URL", "https://media.luxeillum.com").rstrip("/")
 API_KEY = os.environ.get("API_KEY", "")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
+OFFLOAD_COMPOSITES = os.environ.get("OFFLOAD_COMPOSITES", "").lower() in {"1", "true", "yes", "on"}
+OBJECT_STORAGE_ENDPOINT = os.environ.get("OBJECT_STORAGE_ENDPOINT", "").strip()
+OBJECT_STORAGE_BUCKET = os.environ.get("OBJECT_STORAGE_BUCKET", "").strip()
+OBJECT_STORAGE_ACCESS_KEY = os.environ.get("OBJECT_STORAGE_ACCESS_KEY", "").strip()
+OBJECT_STORAGE_SECRET_KEY = os.environ.get("OBJECT_STORAGE_SECRET_KEY", "").strip()
+OBJECT_STORAGE_REGION = os.environ.get("OBJECT_STORAGE_REGION", "auto").strip() or "auto"
+OBJECT_STORAGE_PUBLIC_BASE_URL = os.environ.get("OBJECT_STORAGE_PUBLIC_BASE_URL", "").rstrip("/")
+OBJECT_STORAGE_KEY_PREFIX = os.environ.get("OBJECT_STORAGE_KEY_PREFIX", "").strip().strip("/")
 
 for d in ["_named", "_thumb", "_composite"]:
     (UPLOAD_DIR / d).mkdir(parents=True, exist_ok=True)
@@ -242,7 +251,7 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
     if proc2.returncode != 0:
         raise HTTPException(500, f"Concat error: {stderr2.decode()[-600:]}")
 
-    url = f"{BASE_URL}/files/_composite/{out_id}.mp4"
+    url = await _publish_composite(out_id, out_path)
     return {"public_id": f"_composite/{out_id}", "url": url, "secure_url": url}
 
 
@@ -251,13 +260,18 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
 @app.delete("/asset/{public_id:path}")
 async def delete_asset(public_id: str, _=Depends(require_api_key)):
     file_path = _find_file(public_id)
-    if not file_path:
-        raise HTTPException(404, "Asset not found")
-    file_path.unlink(missing_ok=True)
+    deleted = False
+    if file_path:
+        file_path.unlink(missing_ok=True)
+        deleted = True
     # Evict thumbnail cache entries for this asset
     prefix = public_id.replace("/", "_")
     for cached in (UPLOAD_DIR / "_thumb").glob(f"{prefix}_*"):
         cached.unlink(missing_ok=True)
+    if await _delete_remote_asset(public_id):
+        deleted = True
+    if not deleted:
+        raise HTTPException(404, "Asset not found")
     return {"result": "ok", "public_id": public_id}
 
 
@@ -1062,3 +1076,76 @@ def _build_scale_filter(w: int, h: int, c: str, g: str) -> str:
     if c == "fill":
         return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
     return f"scale={w}:{h}"
+
+
+def _object_storage_enabled() -> bool:
+    return OFFLOAD_COMPOSITES
+
+
+def _object_storage_ready() -> bool:
+    return all([
+        OBJECT_STORAGE_ENDPOINT,
+        OBJECT_STORAGE_BUCKET,
+        OBJECT_STORAGE_ACCESS_KEY,
+        OBJECT_STORAGE_SECRET_KEY,
+        OBJECT_STORAGE_PUBLIC_BASE_URL,
+    ])
+
+
+def _object_key(*parts: str) -> str:
+    clean_parts = [p.strip("/") for p in parts if p and p.strip("/")]
+    if OBJECT_STORAGE_KEY_PREFIX:
+        clean_parts.insert(0, OBJECT_STORAGE_KEY_PREFIX)
+    return "/".join(clean_parts)
+
+
+def _object_storage_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=OBJECT_STORAGE_ENDPOINT,
+        aws_access_key_id=OBJECT_STORAGE_ACCESS_KEY,
+        aws_secret_access_key=OBJECT_STORAGE_SECRET_KEY,
+        region_name=OBJECT_STORAGE_REGION,
+    )
+
+
+def _upload_file_to_object_storage(local_path: Path, key: str, content_type: str) -> None:
+    client = _object_storage_client()
+    extra_args = {"ContentType": content_type}
+    client.upload_file(str(local_path), OBJECT_STORAGE_BUCKET, key, ExtraArgs=extra_args)
+
+
+def _delete_file_from_object_storage(key: str) -> bool:
+    client = _object_storage_client()
+    resp = client.delete_object(Bucket=OBJECT_STORAGE_BUCKET, Key=key)
+    return bool(resp)
+
+
+async def _publish_composite(out_id: str, out_path: Path) -> str:
+    if not _object_storage_enabled():
+        return f"{BASE_URL}/files/_composite/{out_id}.mp4"
+
+    if not _object_storage_ready():
+        raise HTTPException(500, "Object storage offload is enabled but not fully configured")
+
+    key = _object_key("_composite", f"{out_id}.mp4")
+    try:
+        await asyncio.to_thread(_upload_file_to_object_storage, out_path, key, "video/mp4")
+    except Exception as exc:
+        raise HTTPException(500, f"Object storage upload failed: {exc}") from exc
+
+    out_path.unlink(missing_ok=True)
+    return f"{OBJECT_STORAGE_PUBLIC_BASE_URL}/{key}"
+
+
+async def _delete_remote_asset(public_id: str) -> bool:
+    if not _object_storage_enabled() or not _object_storage_ready():
+        return False
+    if not public_id.startswith("_composite/"):
+        return False
+
+    key = _object_key(f"{public_id}.mp4")
+    try:
+        return await asyncio.to_thread(_delete_file_from_object_storage, key)
+    except Exception:
+        return False

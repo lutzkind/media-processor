@@ -43,6 +43,14 @@ All write endpoints require `X-Api-Key: <API_KEY>` header when `API_KEY` env var
 | `BASE_URL` | `https://media.luxeillum.com` | Public base URL for file links |
 | `UPLOAD_DIR` | `/data/uploads` | Where files are stored |
 | `API_KEY` | *(empty = no auth)* | Secret for write endpoints |
+| `OFFLOAD_COMPOSITES` | `false` | When true, upload finished composite videos to object storage and delete the local copy |
+| `OBJECT_STORAGE_ENDPOINT` | *(empty)* | S3-compatible endpoint, for R2 use `https://<account_id>.r2.cloudflarestorage.com` |
+| `OBJECT_STORAGE_BUCKET` | *(empty)* | Bucket name for offloaded composite videos |
+| `OBJECT_STORAGE_ACCESS_KEY` | *(empty)* | S3/R2 access key ID |
+| `OBJECT_STORAGE_SECRET_KEY` | *(empty)* | S3/R2 secret access key |
+| `OBJECT_STORAGE_REGION` | `auto` | Region name for the S3 client; R2 uses `auto` |
+| `OBJECT_STORAGE_PUBLIC_BASE_URL` | *(empty)* | Public base URL used in returned composite links, for example an R2 custom domain or `https://pub-...r2.dev` |
+| `OBJECT_STORAGE_KEY_PREFIX` | *(empty)* | Optional prefix inside the bucket, for example `media` |
 
 ### Pre-load named assets (one-time)
 
