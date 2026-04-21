@@ -7,7 +7,7 @@ import shutil
 import uuid
 from pathlib import Path
 from typing import Optional
-from urllib.request import urlopen
+from urllib.request import Request as UrlRequest, urlopen
 
 import aiofiles
 import boto3
@@ -111,7 +111,17 @@ async def _thumbnail_response(public_id: str, w: int, h: int, c: str, g: str, t:
         if remote_source_url:
             temp_source_path = UPLOAD_DIR / "_thumb" / f"{hashlib.sha1(remote_source_url.encode('utf-8')).hexdigest()}.source.mp4"
             def _download_remote_source() -> None:
-                with urlopen(remote_source_url, timeout=60) as response, open(temp_source_path, "wb") as out:
+                request = UrlRequest(
+                    remote_source_url,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (X11; Linux x86_64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/135.0.0.0 Safari/537.36"
+                        )
+                    },
+                )
+                with urlopen(request, timeout=60) as response, open(temp_source_path, "wb") as out:
                     shutil.copyfileobj(response, out)
             try:
                 await asyncio.to_thread(_download_remote_source)
