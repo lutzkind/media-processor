@@ -1,10 +1,13 @@
 import asyncio
+import hashlib
 import mimetypes
 import os
 import secrets
+import shutil
 import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.request import urlopen
 
 import aiofiles
 import boto3
@@ -86,8 +89,17 @@ async def upload_file(
 async def _thumbnail_response(public_id: str, w: int, h: int, c: str, g: str, t: float):
     """Extract a JPEG thumbnail from a video or image file."""
     file_path = _find_file(public_id)
+    remote_source_url = None
+    temp_source_path = None
+
+    if not file_path and _is_remote_composite(public_id):
+        remote_source_url = _remote_composite_url(public_id)
+        if not remote_source_url:
+            raise HTTPException(404, f"Asset '{public_id}' not found")
+
     if not file_path:
-        raise HTTPException(404, f"Asset '{public_id}' not found")
+        if not remote_source_url:
+            raise HTTPException(404, f"Asset '{public_id}' not found")
 
     # Deterministic cache key
     cache_name = f"{public_id.replace('/', '_')}_{w}x{h}_{c}_{g}_{t:.1f}.jpg"
@@ -95,10 +107,21 @@ async def _thumbnail_response(public_id: str, w: int, h: int, c: str, g: str, t:
 
     if not thumb_path.exists():
         vf = _build_scale_filter(w, h, c, g)
+        input_target = str(file_path) if file_path else remote_source_url
+        if remote_source_url:
+            temp_source_path = UPLOAD_DIR / "_thumb" / f"{hashlib.sha1(remote_source_url.encode('utf-8')).hexdigest()}.source.mp4"
+            def _download_remote_source() -> None:
+                with urlopen(remote_source_url, timeout=60) as response, open(temp_source_path, "wb") as out:
+                    shutil.copyfileobj(response, out)
+            try:
+                await asyncio.to_thread(_download_remote_source)
+            except Exception as exc:
+                raise HTTPException(404, f"Asset '{public_id}' not found") from exc
+            input_target = str(temp_source_path)
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(t),
-            "-i", str(file_path),
+            "-i", input_target,
             "-frames:v", "1",
             "-vf", vf,
             "-q:v", "2",
@@ -108,6 +131,8 @@ async def _thumbnail_response(public_id: str, w: int, h: int, c: str, g: str, t:
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if temp_source_path:
+            temp_source_path.unlink(missing_ok=True)
         if proc.returncode != 0:
             raise HTTPException(500, f"Thumbnail error: {stderr.decode()[-600:]}")
 
@@ -1054,6 +1079,17 @@ def _find_file(public_id: Optional[str]) -> Optional[Path]:
         if p.exists() and p.is_file():
             return p
     return None
+
+
+def _is_remote_composite(public_id: Optional[str]) -> bool:
+    return bool(public_id and public_id.startswith("_composite/") and _object_storage_enabled() and _object_storage_ready())
+
+
+def _remote_composite_url(public_id: str) -> Optional[str]:
+    if not _is_remote_composite(public_id):
+        return None
+    key = _object_key(f"{public_id}.mp4")
+    return f"{OBJECT_STORAGE_PUBLIC_BASE_URL}/{key}"
 
 
 def _find_file_named(name: str) -> Optional[Path]:
