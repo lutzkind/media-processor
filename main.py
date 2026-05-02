@@ -2,7 +2,6 @@ import asyncio
 import hashlib
 import mimetypes
 import os
-import secrets
 import shutil
 import uuid
 from pathlib import Path
@@ -11,8 +10,8 @@ from urllib.request import Request as UrlRequest, urlopen
 
 import aiofiles
 import boto3
-from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Media Processor API")
@@ -34,13 +33,6 @@ for d in ["_named", "_thumb", "_composite"]:
     (UPLOAD_DIR / d).mkdir(parents=True, exist_ok=True)
 
 
-# ── auth ─────────────────────────────────────────────────────────────────────
-
-def require_api_key(x_api_key: str = Header(default="")):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(401, "Invalid API key")
-
-
 # ── upload ───────────────────────────────────────────────────────────────────
 
 @app.post("/upload")
@@ -48,7 +40,6 @@ async def upload_file(
     file: UploadFile = File(...),
     folder: Optional[str] = Form(None),
     name: Optional[str] = Form(None),  # store as a named/pre-set asset (e.g. "faceintro", "video")
-    _=Depends(require_api_key),
 ):
     """
     Upload a file. Returns {public_id, url, secure_url} — same shape as Cloudinary upload response.
@@ -188,7 +179,7 @@ class CompositeRequest(BaseModel):
 
 
 @app.post("/composite")
-async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
+async def create_composite(req: CompositeRequest):
     """
     Build a two-part composite video:
       Part 1 — base image or base video with the overlay video displayed
@@ -293,7 +284,7 @@ async def create_composite(req: CompositeRequest, _=Depends(require_api_key)):
 # ── delete ───────────────────────────────────────────────────────────────────
 
 @app.delete("/asset/{public_id:path}")
-async def delete_asset(public_id: str, _=Depends(require_api_key)):
+async def delete_asset(public_id: str):
     file_path = _find_file(public_id)
     deleted = False
     if file_path:
@@ -326,51 +317,10 @@ async def health():
     return {"status": "ok"}
 
 
-# ── session store (in-memory, single-node) ───────────────────────────────────
-# Maps session token → True. Cleared on restart; fine for a single-user tool.
-_sessions: set[str] = set()
-DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", API_KEY or "changeme")
-
-
-def _is_authenticated(session: Optional[str] = Cookie(default=None)) -> bool:
-    return session is not None and session in _sessions
-
-
-# ── login ─────────────────────────────────────────────────────────────────────
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(error: str = ""):
-    err_html = f'<p class="error">{error}</p>' if error else ""
-    return HTMLResponse(_LOGIN_HTML.replace("<!-- ERROR -->", err_html))
-
-
-@app.post("/login")
-async def login_submit(username: str = Form(...), password: str = Form(...)):
-    if username == DASHBOARD_USERNAME and password == DASHBOARD_PASSWORD:
-        token = secrets.token_hex(32)
-        _sessions.add(token)
-        resp = RedirectResponse("/", status_code=303)
-        resp.set_cookie("session", token, httponly=True, samesite="lax", max_age=86400 * 30)
-        return resp
-    return RedirectResponse("/login?error=Invalid+credentials", status_code=303)
-
-
-@app.post("/logout")
-async def logout(session: Optional[str] = Cookie(default=None)):
-    if session:
-        _sessions.discard(session)
-    resp = RedirectResponse("/login", status_code=303)
-    resp.delete_cookie("session")
-    return resp
-
-
 # ── dashboard ────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(authenticated: bool = Depends(_is_authenticated)):
-    if not authenticated:
-        return RedirectResponse("/login", status_code=303)
+async def dashboard():
 
     def fmt_size(b: int) -> str:
         for unit in ("B", "KB", "MB", "GB"):
@@ -535,16 +485,13 @@ async def dashboard(authenticated: bool = Depends(_is_authenticated)):
     )
 
 
-# ── UI helpers (session-auth) ─────────────────────────────────────────────────
+# ── UI helpers ────────────────────────────────────────────────────────────────
 
 @app.post("/ui/upload-named")
 async def ui_upload_named(
     file: UploadFile = File(...),
     name: str = Form(...),
-    authenticated: bool = Depends(_is_authenticated),
 ):
-    if not authenticated:
-        raise HTTPException(401)
     ext = Path(file.filename or "file").suffix.lower() or ".bin"
     save_dir = UPLOAD_DIR / "_named"
     for old in save_dir.glob(f"{name}.*"):
@@ -560,10 +507,7 @@ async def ui_upload_named(
 async def ui_upload_file(
     file: UploadFile = File(...),
     folder: str = Form(""),
-    authenticated: bool = Depends(_is_authenticated),
 ):
-    if not authenticated:
-        raise HTTPException(401)
     ext = Path(file.filename or "file").suffix.lower() or ".bin"
     raw_id = str(uuid.uuid4())
     clean_folder = folder.strip().strip("/")
@@ -585,10 +529,7 @@ async def ui_upload_file(
 @app.post("/ui/delete-file")
 async def ui_delete_file(
     request: Request,
-    authenticated: bool = Depends(_is_authenticated),
 ):
-    if not authenticated:
-        raise HTTPException(401)
     body = await request.json()
     public_id = body.get("public_id", "")
     fp = _find_file(public_id)
@@ -597,61 +538,6 @@ async def ui_delete_file(
     fp.unlink()
     return {"deleted": public_id}
 
-
-# ── HTML templates ─────────────────────────────────────────────────────────────
-
-_LOGIN_HTML = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Media Processor — Sign in</title>
-  <style>
-    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-         background:#f0f4f8;min-height:100vh;display:flex;flex-direction:column;
-         align-items:center;justify-content:center}
-    .logo-row{display:flex;align-items:center;gap:10px;margin-bottom:28px}
-    .logo-icon{width:40px;height:40px;background:linear-gradient(135deg,#3448c5,#5b6df8);
-               border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px}
-    .logo-text{font-size:22px;font-weight:700;color:#1a202c}
-    .card{background:#fff;border-radius:12px;
-          box-shadow:0 4px 24px rgba(0,0,0,.10),0 1px 4px rgba(0,0,0,.06);
-          padding:40px 44px 36px;width:420px}
-    .card h2{font-size:22px;font-weight:700;color:#1a202c;text-align:center;margin-bottom:28px}
-    label{display:block;font-size:13px;font-weight:600;color:#4a5568;margin-bottom:6px;margin-top:18px}
-    input[type=text],input[type=password]{width:100%;padding:10px 14px;border:1.5px solid #cbd5e0;
-                         border-radius:7px;font-size:15px;color:#1a202c;outline:none;transition:border-color .15s}
-    input[type=text]:focus,input[type=password]:focus{border-color:#3448c5;box-shadow:0 0 0 3px rgba(52,72,197,.12)}
-    button[type=submit]{margin-top:24px;width:100%;background:#3448c5;color:#fff;border:none;
-                        border-radius:7px;padding:12px;font-size:14px;font-weight:700;
-                        letter-spacing:.04em;cursor:pointer;text-transform:uppercase;transition:background .15s}
-    button[type=submit]:hover{background:#2a3aaa}
-    .error{background:#fff5f5;border:1px solid #feb2b2;color:#c53030;border-radius:7px;
-           padding:10px 14px;font-size:13px;text-align:center;margin-bottom:8px}
-    .hint{text-align:center;margin-top:18px;font-size:12px;color:#a0aec0}
-  </style>
-</head>
-<body>
-  <div class="logo-row">
-    <div class="logo-icon">&#127916;</div>
-    <span class="logo-text">Media Processor</span>
-  </div>
-  <div class="card">
-    <h2>Sign in to your account</h2>
-    <!-- ERROR -->
-    <form method="post" action="/login">
-      <label for="un">Username</label>
-      <input type="text" id="un" name="username" autofocus placeholder="Enter your username" autocomplete="username">
-      <label for="pw">Password</label>
-      <input type="password" id="pw" name="password" placeholder="Enter your password" autocomplete="current-password">
-      <button type="submit">Sign In</button>
-    </form>
-    <p class="hint">Self-hosted media service</p>
-  </div>
-</body>
-</html>"""
 
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
