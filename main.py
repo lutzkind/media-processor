@@ -10,7 +10,7 @@ from urllib.request import Request as UrlRequest, urlopen
 
 import aiofiles
 import boto3
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
